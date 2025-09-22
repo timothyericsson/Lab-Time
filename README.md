@@ -1,6 +1,6 @@
-Are you tired of fake-time or other tools that handle synching your clock with the target lab? 
+Are you tired of faketime or wrangling other tools to handle synching your clock with the target lab? This is the tool for you! 
 
-Please place this script into /usr/bin or another directory in sudo secure_path, don't forget to chmod +x the file after creation 
+Please place this script into /usr/bin or another directory in sudo secure_path, and don't forget to chmod +x the file after creation 
 
 Usage:
 
