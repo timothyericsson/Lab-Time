@@ -4,7 +4,7 @@ Please place this script into /usr/bin or another directory in sudo secure_path,
 
 Usage:
 
-  sudo lab-time <IP>
+  sudo lab-time LAB_IP
 
   sudo lab-time stop
 
