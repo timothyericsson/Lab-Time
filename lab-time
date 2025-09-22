@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lab-time: point your machine's time sync at a lab DC, or restore defaults
+#
+# Commands:
+#   lab-time <DC_IP_or_FQDN>   Start syncing to the given Domain Controller
+#   lab-time stop              Remove lab override and return to system defaults
+#   lab-time status            Show current time source and last sync info
+#   lab-time -h | --help       Show detailed help
+#
+# How it works:
+#   - Creates a simple systemd-timesyncd override that sets NTP=<DC> with no fallbacks
+#   - Restarts timesyncd and forces NTP on
+#   - If ntpdate exists, does a one shot step to correct time immediately
+#   - "stop" deletes the override and restarts timesyncd so defaults resume
+#
+# Requirements:
+#   - Linux with systemd-timesyncd (Ubuntu, Debian, Kali and similar)
+#   - sudo for writing the override and restarting the service
+#
+# Notes:
+#   - This minimal version does not back up any custom timesyncd config
+#   - On stop, your distro defaults take over again
+#   - Kerberos cares about absolute time, not timezone
+
+OVERRIDE_DIR="/etc/systemd/timesyncd.conf.d"
+OVERRIDE_FILE="${OVERRIDE_DIR}/90-lab-time.conf"
+
+need_root() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "Please place this tool into /usr/bin and run with sudo"
+    exit 1
+  fi
+}
+
+print_help() {
+  cat <<'EOF'
+lab-time: quick time sync switcher for AD labs
+
+Usage:
+  sudo lab-time <DC_IP_or_FQDN>
+  sudo lab-time stop
+  sudo lab-time status
+  sudo lab-time -h | --help
+
+What it does:
+  1. Writes an override file at /etc/systemd/timesyncd.conf.d/90-lab-time.conf
+     with your lab DC as the only NTP source.
+  2. Restarts systemd-timesyncd and enables NTP.
+  3. If available, runs: ntpdate -u <DC> to step the clock immediately.
+  4. "stop" removes the override and restarts timesyncd so defaults resume.
+
+Examples:
+  sudo lab-time 10.10.10.161     Start syncing to the DC at 10.10.10.161
+  sudo lab-time forest.htb.local  Start syncing to the DC by name
+  sudo lab-time status            Show current source and last sync time
+  sudo lab-time stop              Return to system defaults
+
+Why this is useful:
+  Kerberos rejects tickets when clocks are far apart. Pointing your host at the
+  lab DC keeps your machine in lockstep with the KDC so kinit, Impacket, and
+  BloodHound Kerberos flows work reliably.
+
+Safety:
+  This simple script does not back up custom timesync settings. On stop it
+  deletes only the lab override and timesyncd falls back to distro defaults.
+
+EOF
+}
+
+status() {
+  echo "Source and sync status:"
+  timedatectl show-timesync --all | grep -E 'Server(Address|Name)|LastSync' || true
+  echo
+  timedatectl status | sed -n '1,12p' || true
+}
+
+start_lab() {
+  local DC="$1"
+  if [[ -z "$DC" ]]; then
+    echo "Usage: sudo lab-time <DC_IP_or_FQDN>"
+    exit 1
+  fi
+  mkdir -p "$OVERRIDE_DIR"
+  cat > "$OVERRIDE_FILE" <<EOF
+[Time]
+NTP=${DC}
+FallbackNTP=
+EOF
+  systemctl restart systemd-timesyncd
+  timedatectl set-ntp true || true
+  if command -v ntpdate >/dev/null 2>&1; then ntpdate -u "$DC" || true; fi
+  sleep 1
+  echo "Now syncing to ${DC}"
+  status
+}
+
+stop_lab() {
+  rm -f "$OVERRIDE_FILE"
+  systemctl restart systemd-timesyncd
+  timedatectl set-ntp true || true
+  sleep 1
+  echo "Restored default time sync"
+  status
+}
+
+main() {
+  need_root
+  case "${1-}" in
+    -h|--help|help) print_help ;;
+    stop)           stop_lab ;;
+    status)         status ;;
+    "")             print_help; exit 1 ;;
+    *)              start_lab "$1" ;;
+  esac
+}
+main "$@"
