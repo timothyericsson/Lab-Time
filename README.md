@@ -20,15 +20,11 @@ What it does:
   4. "stop" removes the override and restarts timesyncd so defaults resume.
 
 Examples:
-  sudo lab-time 10.10.10.161     Start syncing to the DC at 10.10.10.161
-  sudo lab-time forest.htb.local  Start syncing to the DC by name
-  sudo lab-time status            Show current source and last sync time
-  sudo lab-time stop              Return to system defaults
+  sudo lab-time 10.8.10.160     Start syncing to the DC at 10.8.10.160
 
-Why this is useful:
-  Kerberos rejects tickets when clocks are far apart. Pointing your host at the
-  lab DC keeps your machine in lockstep with the KDC so kinit, Impacket, and
-  BloodHound Kerberos flows work reliably.
+  sudo lab-time status            Show current source and last sync time
+
+  sudo lab-time stop              Return to system defaults
 
 Safety:
   This simple script does not back up custom timesync settings. On stop it
