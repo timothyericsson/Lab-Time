@@ -1,29 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# lab-time: point your machine's time sync at a lab DC, or restore defaults
-#
-# Commands:
-#   lab-time <DC_IP_or_FQDN>   Start syncing to the given Domain Controller
-#   lab-time stop              Remove lab override and return to system defaults
-#   lab-time status            Show current time source and last sync info
-#   lab-time -h | --help       Show detailed help
-#
-# How it works:
-#   - Creates a simple systemd-timesyncd override that sets NTP=<DC> with no fallbacks
-#   - Restarts timesyncd and forces NTP on
-#   - If ntpdate exists, does a one shot step to correct time immediately
-#   - "stop" deletes the override and restarts timesyncd so defaults resume
-#
-# Requirements:
-#   - Linux with systemd-timesyncd (Ubuntu, Debian, Kali and similar)
-#   - sudo for writing the override and restarting the service
-#
-# Notes:
-#   - This minimal version does not back up any custom timesyncd config
-#   - On stop, your distro defaults take over again
-#   - Kerberos cares about absolute time, not timezone
-
 OVERRIDE_DIR="/etc/systemd/timesyncd.conf.d"
 OVERRIDE_FILE="${OVERRIDE_DIR}/90-lab-time.conf"
 
