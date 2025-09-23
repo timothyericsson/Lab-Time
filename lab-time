@@ -15,17 +15,18 @@ need_root() {
 
 print_help() {
   cat <<'EOF'
-lab-time: quick time alignment to a DC or member server, with a reliable stop
+lab-time: quick time alignment to a DC or member server, with VMware host-sync control and reliable stop
 
-Examples
-  sudo lab-time 10.10.10.161
+Examples:
+  sudo lab-time 10.8.0.160
   sudo lab-time status
   sudo lab-time stop
 
 Notes:
-  Kerberos checks the service host time. Align to the exact host you will talk to.
-  --force stops time daemons before setting the clock so nothing reverts it.
-  stop restores your original time and NTP settings from before the first align.
+  - Kerberos checks the service host time. Align to the exact host you will talk to.
+  - --force stops time daemons before setting the clock so nothing reverts it.
+  - On VMware guests, this tool will auto disable VMware host→guest time sync during a session
+    and restore it on stop. This prevents the host from snapping your lab time back.
 EOF
 }
 
@@ -38,7 +39,57 @@ status() {
   else
     echo "NTP override: none"
   fi
+  vmware_status_brief
 }
+
+# ---------- VMware helpers ----------
+
+is_vmware_guest() {
+  # returns 0 if VMware detected
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    [ "$(systemd-detect-virt 2>/dev/null || true)" = "vmware" ] && return 0 || return 1
+  fi
+  # fallback simple DMI check
+  if [ -r /sys/class/dmi/id/sys_vendor ] && grep -qi vmware /sys/class/dmi/id/sys_vendor; then
+    return 0
+  fi
+  return 1
+}
+
+has_vmware_toolbox() {
+  command -v vmware-toolbox-cmd >/dev/null 2>&1
+}
+
+vmware_timesync_status_raw() {
+  vmware-toolbox-cmd timesync status 2>/dev/null || true
+}
+
+vmware_timesync_enabled_q() {
+  # returns 0 if enabled, 1 if disabled or unknown
+  local out
+  out="$(vmware_timesync_status_raw)"
+  echo "$out" | grep -qi "Enabled" && return 0
+  echo "$out" | grep -qi "Disabled" && return 1
+  return 1
+}
+
+vmware_disable_timesync() {
+  vmware-toolbox-cmd timesync disable >/dev/null 2>&1 || true
+}
+
+vmware_enable_timesync() {
+  vmware-toolbox-cmd timesync enable >/dev/null 2>&1 || true
+}
+
+vmware_status_brief() {
+  if is_vmware_guest && has_vmware_toolbox; then
+    local out
+    out="$(vmware_timesync_status_raw)"
+    [ -n "$out" ] && echo "VMware Tools timesync: $out"
+  fi
+}
+
+# ---------- General helpers ----------
 
 to_epoch_now() { date -u +%s; }
 to_epoch_from_string() { date -u -d "$1" +%s; }
@@ -112,14 +163,24 @@ save_state_once() {
   if [ -f "$STATE_FILE" ]; then
     return 0
   fi
-  local prev_time prev_ntp has_override
+  local prev_time prev_ntp has_override vmware_state vmware_mode
   prev_time="$(date -u +"%a, %d %b %Y %H:%M:%S UTC")"
   prev_ntp="$(timedatectl show -p NTP --value 2>/dev/null || echo unknown)"
   if [ -f "$OVERRIDE_FILE" ]; then has_override="yes"; else has_override="no"; fi
+
+  vmware_state="not_vmware"
+  vmware_mode="unknown"
+  if is_vmware_guest && has_vmware_toolbox; then
+    vmware_state="vmware"
+    if vmware_timesync_enabled_q; then vmware_mode="enabled"; else vmware_mode="disabled"; fi
+  fi
+
   cat > "$STATE_FILE" <<EOF
 PREV_TIME_UTC='$prev_time'
 PREV_NTP='$prev_ntp'
 PREV_OVERRIDE='$has_override'
+PREV_VMWARE_STATE='$vmware_state'
+PREV_VMWARE_TIMESYNC='$vmware_mode'
 EOF
 }
 
@@ -131,22 +192,28 @@ restore_state() {
   # shellcheck disable=SC1090
   . "$STATE_FILE"
 
-  # Remove our override if we created one later
-  remove_ntp_override
+  # Restore VMware timesync if we had it enabled originally
+  if [ "${PREV_VMWARE_STATE:-not_vmware}" = "vmware" ] && has_vmware_toolbox; then
+    if [ "${PREV_VMWARE_TIMESYNC:-unknown}" = "enabled" ]; then
+      echo "Re-enabling VMware host time sync"
+      vmware_enable_timesync
+    fi
+  fi
 
-  # Restore time
+  # Remove our timesyncd override and restore NTP toggle
+  remove_ntp_override
+  if [ "$PREV_NTP" = "yes" ] || [ "$PREV_NTP" = "enabled" ] || [ "$PREV_NTP" = "true" ]; then
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+  else
+    timedatectl set-ntp false >/dev/null 2>&1 || true
+  fi
+
+  # Restore previous time
   if date -u -s "$PREV_TIME_UTC" >/dev/null 2>&1; then
     hwclock --systohc >/dev/null 2>&1 || true
     echo "Restored previous UTC time: $PREV_TIME_UTC"
   else
     echo "Failed to restore previous time"
-  fi
-
-  # Restore NTP toggle
-  if [ "$PREV_NTP" = "yes" ] || [ "$PREV_NTP" = "enabled" ] || [ "$PREV_NTP" = "true" ]; then
-    timedatectl set-ntp true >/dev/null 2>&1 || true
-  else
-    timedatectl set-ntp false >/dev/null 2>&1 || true
   fi
 
   rm -f "$STATE_FILE" || true
@@ -165,7 +232,7 @@ set_time_to_str() {
   fi
 
   if ! date -u -s "$s" >/dev/null 2>&1; then
-    echo "date -s failed. Are you in WSL or a locked container"
+    echo "date -s failed. Are you in a locked environment"
     return 1
   fi
 
@@ -192,9 +259,18 @@ try_ntpdate_step() {
 
 align_to_host() {
   local H="$1" D="${2-}" U="${3-}" P="${4-}" force="$5"
-  local t epoch
+  local t epoch changed=0
 
   echo "== Host: $H =="
+
+  # If running in VMware, disable host time sync for the session so the host does not revert our set
+  if is_vmware_guest && has_vmware_toolbox; then
+    if vmware_timesync_enabled_q; then
+      echo "VMware guest detected. Disabling VMware host time sync for this session..."
+      vmware_disable_timesync
+      echo "VMware Tools timesync: $(vmware_timesync_status_raw)"
+    fi
+  fi
 
   # 1) LDAP time
   if t="$(ldap_current_time "$H" "$D" "$U" "$P")"; then
@@ -202,28 +278,36 @@ align_to_host() {
     print_skew_calc "Skew before (LDAP)" "$epoch"
     if set_time_to_str "$t" "$force"; then
       print_skew_calc "Skew after  (LDAP)" "$epoch"
-      return 0
+      changed=1
     fi
   fi
 
-  # 2) SMB time
-  if t="$(smb_srvinfo_time "$H" "$D" "$U" "$P")"; then
-    epoch="$(to_epoch_from_string "$t")"
-    print_skew_calc "Skew before (SMB)" "$epoch"
-    if set_time_to_str "$t" "$force"; then
-      print_skew_calc "Skew after  (SMB)" "$epoch"
-      return 0
+  # 2) SMB time if still not changed
+  if [ $changed -eq 0 ]; then
+    if t="$(smb_srvinfo_time "$H" "$D" "$U" "$P")"; then
+      epoch="$(to_epoch_from_string "$t")"
+      print_skew_calc "Skew before (SMB)" "$epoch"
+      if set_time_to_str "$t" "$force"; then
+        print_skew_calc "Skew after  (SMB)" "$epoch"
+        changed=1
+      fi
     fi
   fi
 
   # 3) NTP step
-  if try_ntpdate_step "$H" "$force"; then
-    echo "Aligned using NTP step"
-    return 0
+  if [ $changed -eq 0 ]; then
+    if try_ntpdate_step "$H" "$force"; then
+      echo "Aligned using NTP step"
+      changed=1
+    fi
   fi
 
-  echo "Could not read or set time for $H"
-  return 1
+  if [ $changed -eq 1 ]; then
+    return 0
+  else
+    echo "Could not read or set time for $H"
+    return 1
+  fi
 }
 
 enable_ntp_cmd() {
@@ -233,12 +317,15 @@ enable_ntp_cmd() {
 }
 
 stop_cmd() {
-  echo "Restoring previous time and NTP settings..."
+  echo "Restoring previous time, NTP, and VMware sync settings..."
   if restore_state; then
     echo "Restored."
   else
-    echo "Nothing to restore. To return to defaults, you can re-enable NTP:"
+    echo "Nothing to restore. To return to defaults manually:"
     echo "  sudo timedatectl set-ntp true"
+    if is_vmware_guest && has_vmware_toolbox; then
+      echo "  sudo vmware-toolbox-cmd timesync enable"
+    fi
   fi
   status
 }
@@ -276,10 +363,10 @@ main() {
   done
 
   if [ ${#HOSTS[@]} -eq 0 ]; then
-    echo "Provide at least one host. Example: sudo lab-time 10.8.0.160"; exit 1
+    echo "Provide at least one host. Example: sudo lab-time FOREST.htb.local"; exit 1
   fi
 
-  # Save original state only once per session so stop goes back to the real time
+  # Save original state only once per session so stop goes back to real time and VMware sync state
   save_state_once
 
   echo "Local before: $(date -u +"%a, %d %b %Y %H:%M:%S UTC")"
